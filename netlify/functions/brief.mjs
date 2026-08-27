@@ -50,13 +50,12 @@ Return ONLY the briefing in this markdown format:
 - Flag developments related to: AI safety/regulation, compute infrastructure, AI talent, trade/tariff implications
 - If a source is paywalled or unavailable, skip it and move on`;
 
-const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
+const RATE_LIMIT_WINDOW = 60 * 1000;
 const MAX_REQUESTS_PER_WINDOW = 3;
 const requestLog = [];
 
 function isRateLimited() {
   const now = Date.now();
-  // Remove old entries
   while (requestLog.length > 0 && requestLog[0] < now - RATE_LIMIT_WINDOW) {
     requestLog.shift();
   }
@@ -67,8 +66,25 @@ function isRateLimited() {
   return false;
 }
 
+async function callWithRetry(fn, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isRateLimit =
+        err?.status === 429 ||
+        (err?.message && err.message.includes("rate_limit"));
+      if (isRateLimit && attempt < maxRetries) {
+        const waitMs = (attempt + 1) * 15000; // 15s, 30s, 45s
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 export default async (req, context) => {
-  // CORS
   if (req.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -107,21 +123,22 @@ export default async (req, context) => {
 
     const client = new Anthropic();
 
-    const response = await client.messages.create({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 4096,
-      system: SYSTEM_PROMPT,
-      tools: [
-        {
-          type: "web_search_20250305",
-          name: "web_search",
-          max_uses: 20,
-        },
-      ],
-      messages: [{ role: "user", content: userMessage }],
-    });
+    const response = await callWithRetry(() =>
+      client.messages.create({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 4096,
+        system: SYSTEM_PROMPT,
+        tools: [
+          {
+            type: "web_search_20250305",
+            name: "web_search",
+            max_uses: 10,
+          },
+        ],
+        messages: [{ role: "user", content: userMessage }],
+      })
+    );
 
-    // Extract text from response
     let briefing = "";
     for (const block of response.content) {
       if (block.type === "text") {
@@ -138,13 +155,35 @@ export default async (req, context) => {
     });
   } catch (err) {
     console.error("Brief generation error:", err);
+    const message = err?.message || String(err);
+
+    // Friendly error for rate limits
+    if (message.includes("rate_limit")) {
+      return new Response(
+        JSON.stringify({
+          error:
+            "The service is busy right now. Please wait a minute and try again.",
+        }),
+        {
+          status: 429,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        }
+      );
+    }
+
     return new Response(
       JSON.stringify({
-        error: "Failed to generate briefing. Please try again.",
+        error: "Failed to generate briefing. Please try again in a moment.",
       }),
       {
         status: 500,
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+        },
       }
     );
   }
